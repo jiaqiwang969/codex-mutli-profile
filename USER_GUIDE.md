@@ -1,14 +1,13 @@
-# Model Provider Pool Guide
+# 模型提供方池（Model Provider Pool）使用说明
 
-## What it does
-- Adds a `model_provider_pool` list to `config.toml` for automatic provider failover.
-- On missing API keys, auth errors (401/403), or rate limit errors (429), Codex switches immediately.
-- On other retryable errors, Codex switches after the current provider exhausts its stream retry budget.
-- The selected provider is persisted to `model_provider` (active profile if set, otherwise top level).
+## 功能说明
+- 在 `config.toml` 中新增 `model_provider_pool`，用于自动切换 provider。
+- 触发切换：缺少 API Key、鉴权失败（401/403）、限流（429）。
+- 其他可重试错误：当当前 provider 的 stream 重试预算耗尽后切换。
+- 切换后会把 `model_provider` 写回当前 profile（如有）否则写回全局。
 
-## Configure
-Add providers (with distinct IDs) and the pool ordering. You can set the pool
-globally or per profile.
+## 配置方式
+支持全局与 profile 两种配置（profile 优先级更高）。
 
 ```toml
 model_provider = "ppai"
@@ -31,15 +30,15 @@ model_provider = "gemini"
 model_provider_pool = ["gemini", "openai"]
 ```
 
-## Behavior details
-- Profile pools override the top-level pool.
-- If the current provider is in the pool, Codex tries the next entries in order and wraps back to the start, attempting each entry once per turn.
-- If the current provider is not in the pool, Codex starts from the first entry in the pool.
-- Pool entries that are missing `env_key` values are skipped.
-- Ensure the configured model name is valid for every provider in the pool.
+## 行为细节
+- profile 的 `model_provider_pool` 会覆盖全局配置。
+- 如果当前 provider 在池中，会按顺序尝试下一个，并回环到起点（同一 turn 内每个 provider 只尝试一次）。
+- 如果当前 provider 不在池中，则从池的第一个开始尝试。
+- 缺失 `env_key` 或无法读取 API Key 的 provider 会被跳过。
+- 请确保同一个 model 名称在池内所有 provider 都可用。
 
-## Testing with ~/.codex-test/xxxx
-1. Copy your existing config: `cp -a ~/.codex/. ~/.codex-test/xxxx/`
-2. Edit `~/.codex-test/xxxx/config.toml` to add `model_provider_pool`.
-3. Run Codex with `CODEX_HOME=~/.codex-test/xxxx`.
-4. Trigger a failure on the active provider and confirm the background switch message.
+## 使用测试目录
+1. 复制现有配置到测试目录，例如 `~/.codex-test/xxxx`。
+2. 在 `~/.codex-test/xxxx/config.toml` 中加入 `model_provider_pool`。
+3. 运行 Codex 时设置 `CODEX_HOME` 指向测试目录。
+4. 触发一次失败，确认后台输出切换提示信息。
