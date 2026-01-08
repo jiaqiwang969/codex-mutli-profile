@@ -55,6 +55,25 @@ model_provider_pool = ["gemini", "openai-proxy"]
 为避免来回抖动，同一 turn 内每个账号只尝试一次；如果成功，就继续使用当前账号并把选择写回配置，保证后续 turn 稳定。
 profile 独立池是为了不同场景（如 codex/gemini/grok）使用不同账号组，互不干扰。
 
+## 轮询示意图（回环切换）
+下面示意“同一 turn 内按顺序尝试、失败则切下一个、到末尾后回环一次”的流程：
+
+```
+Pool order: [A] -> [B] -> [C] -> [D] -> (wrap to A)
+
+Current provider: B
+
+Turn N:
+  B fails  -> try C
+  C fails  -> try D
+  D fails  -> try A
+  A fails  -> stop (this turn already tried each provider once)
+
+Turn N+1:
+  continue with last successful provider if any;
+  otherwise same pool order applies
+```
+
 ## 行为说明
 - profile 的 `model_provider_pool` 会覆盖全局配置。
 - 触发切换：缺少 API Key、401/403/429、或当前 provider 重试预算耗尽。
