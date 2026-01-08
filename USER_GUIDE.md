@@ -1,5 +1,8 @@
 # 模型提供方池（Model Provider Pool）使用说明
 
+## 基线信息
+- 补丁基于 Codex 源码 commit：`0f8bb4579bd7c0ea905df7124b3a42835159b023`
+
 ## 功能说明
 - 在 `config.toml` 中新增 `model_provider_pool`，用于自动切换 provider。
 - 触发切换：缺少 API Key、鉴权失败（401/403）、限流（429）。

@@ -2,6 +2,9 @@
 
 这是对 Codex 的补丁，增加“账号池/模型提供方池”的自动切换能力，支持按 profile 单独配置，并在失败时回环切换。
 
+## 基线信息
+- 补丁基于 Codex 源码 commit：`0f8bb4579bd7c0ea905df7124b3a42835159b023`
+
 ## 文件说明
 - `codex-provider-pool.patch`：补丁文件
 - `USER_GUIDE.md`：详细说明（中文）
