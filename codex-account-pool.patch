@@ -1,0 +1,746 @@
+diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
+index fb2a3b058..371d7801e 100644
+--- a/codex-rs/core/src/codex.rs
++++ b/codex-rs/core/src/codex.rs
+@@ -1,4 +1,5 @@
+ use std::collections::HashMap;
++use std::collections::HashSet;
+ use std::fmt::Debug;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -7,6 +8,7 @@ use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ 
+ use crate::AuthManager;
++use crate::ModelProviderAccount;
+ use crate::SandboxState;
+ use crate::agent::AgentControl;
+ use crate::agent::AgentStatus;
+@@ -64,6 +66,7 @@ use tokio::sync::Mutex;
+ use tokio::sync::RwLock;
+ use tokio::sync::oneshot;
+ use tokio_util::sync::CancellationToken;
++use toml_edit::value;
+ use tracing::Instrument;
+ use tracing::debug;
+ use tracing::error;
+@@ -83,6 +86,8 @@ use crate::config::Config;
+ use crate::config::Constrained;
+ use crate::config::ConstraintResult;
+ use crate::config::GhostSnapshotConfig;
++use crate::config::edit::ConfigEdit;
++use crate::config::edit::ConfigEditsBuilder;
+ use crate::config::types::ShellEnvironmentPolicy;
+ use crate::context_manager::ContextManager;
+ use crate::environment_context::EnvironmentContext;
+@@ -257,6 +262,7 @@ impl Codex {
+         }
+         let model = models_manager.get_model(&config.model, &config).await;
+         let session_configuration = SessionConfiguration {
++            provider_id: config.model_provider_id.clone(),
+             provider: config.model_provider.clone(),
+             model: model.clone(),
+             model_reasoning_effort: config.model_reasoning_effort,
+@@ -406,6 +412,9 @@ impl TurnContext {
+ #[derive(Clone)]
+ pub(crate) struct SessionConfiguration {
+     /// Provider identifier ("openai", "openrouter", ...).
++    provider_id: String,
++
++    /// Provider configuration.
+     provider: ModelProviderInfo,
+ 
+     /// If not specified, server will use its default model.
+@@ -467,6 +476,17 @@ impl SessionConfiguration {
+         if let Some(cwd) = updates.cwd.clone() {
+             next_configuration.cwd = cwd;
+         }
++        if let (Some(provider_id), Some(provider)) = (
++            updates.model_provider_id.clone(),
++            updates.model_provider.clone(),
++        ) {
++            next_configuration.provider_id = provider_id;
++            next_configuration.provider = provider;
++            let mut updated_config = (*next_configuration.original_config_do_not_use).clone();
++            updated_config.model_provider_id = next_configuration.provider_id.clone();
++            updated_config.model_provider = next_configuration.provider.clone();
++            next_configuration.original_config_do_not_use = Arc::new(updated_config);
++        }
+         Ok(next_configuration)
+     }
+ }
+@@ -477,6 +497,8 @@ pub(crate) struct SessionSettingsUpdate {
+     pub(crate) approval_policy: Option<AskForApproval>,
+     pub(crate) sandbox_policy: Option<SandboxPolicy>,
+     pub(crate) model: Option<String>,
++    pub(crate) model_provider_id: Option<String>,
++    pub(crate) model_provider: Option<ModelProviderInfo>,
+     pub(crate) reasoning_effort: Option<Option<ReasoningEffortConfig>>,
+     pub(crate) reasoning_summary: Option<ReasoningSummaryConfig>,
+     pub(crate) final_output_json_schema: Option<Option<Value>>,
+@@ -1812,6 +1834,7 @@ mod handlers {
+                     reasoning_effort: Some(effort),
+                     reasoning_summary: Some(summary),
+                     final_output_json_schema: Some(final_output_json_schema),
++                    ..Default::default()
+                 },
+             ),
+             Op::UserInput {
+@@ -2307,6 +2330,7 @@ pub(crate) async fn run_task(
+         return None;
+     }
+ 
++    let mut turn_context = turn_context;
+     let model_info = turn_context.client.get_model_info();
+     let auto_compact_limit = model_info.auto_compact_token_limit().unwrap_or(i64::MAX);
+     let total_usage_tokens = sess.get_total_token_usage().await;
+@@ -2387,7 +2411,12 @@ pub(crate) async fn run_task(
+         )
+         .await
+         {
+-            Ok(turn_output) => {
++            Ok(outcome) => {
++                let TurnRunOutcome {
++                    result: turn_output,
++                    turn_context: updated_context,
++                } = outcome;
++                turn_context = updated_context;
+                 let TurnRunResult {
+                     needs_follow_up,
+                     last_agent_message: turn_last_agent_message,
+@@ -2447,6 +2476,200 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>)
+     }
+ }
+ 
++fn should_switch_provider_account(err: &CodexErr, retries: u64, max_retries: u64) -> bool {
++    if matches!(err, CodexErr::EnvVar(_) | CodexErr::RetryLimit(_)) {
++        return true;
++    }
++    if let Some(status) = err.http_status_code_value()
++        && matches!(status, 401 | 403 | 429)
++    {
++        return true;
++    }
++    err.is_retryable() && retries >= max_retries
++}
++
++fn normalize_account_pool(
++    provider_id: &str,
++    provider: &ModelProviderInfo,
++) -> Vec<ModelProviderAccount> {
++    if provider.account_pool.is_empty() {
++        return Vec::new();
++    }
++
++    let mut pool = Vec::new();
++    pool.extend(provider.account_pool.iter().cloned());
++    if let Some(current_account) = provider.current_account() {
++        pool.insert(0, current_account);
++    }
++
++    let mut seen = HashSet::new();
++    pool.into_iter()
++        .filter_map(|account| {
++            let base_url = account
++                .base_url
++                .as_deref()
++                .map(str::trim)
++                .filter(|value| !value.is_empty())
++                .map(str::to_string);
++            let env_key = account
++                .env_key
++                .as_deref()
++                .map(str::trim)
++                .filter(|value| !value.is_empty())
++                .map(str::to_string);
++            let account = ModelProviderAccount { base_url, env_key };
++            if account.base_url.is_none() || account.env_key.is_none() {
++                warn!(
++                    "Skipping account entry for provider {provider_id}: missing base_url or env_key"
++                );
++                None
++            } else if seen.insert(account.clone()) {
++                Some(account)
++            } else {
++                None
++            }
++        })
++        .collect()
++}
++
++fn next_account_from_pool(
++    provider_id: &str,
++    provider: &ModelProviderInfo,
++    attempted_accounts: &mut HashSet<ModelProviderAccount>,
++) -> Option<ModelProviderAccount> {
++    let pool = normalize_account_pool(provider_id, provider);
++    let pool_len = pool.len();
++    if pool_len == 0 {
++        return None;
++    }
++
++    let current_account = provider.current_account();
++    let start_index = current_account
++        .as_ref()
++        .and_then(|account| pool.iter().position(|item| item == account))
++        .map(|index| (index + 1) % pool_len)
++        .unwrap_or(0);
++
++    for offset in 0..pool_len {
++        let index = (start_index + offset) % pool_len;
++        let account = &pool[index];
++        if attempted_accounts.contains(account) {
++            continue;
++        }
++        if let Err(err) = provider.with_account(account).api_key() {
++            warn!("Skipping account in provider {provider_id}: {err}");
++            attempted_accounts.insert(account.clone());
++            continue;
++        }
++        attempted_accounts.insert(account.clone());
++        return Some(account.clone());
++    }
++
++    None
++}
++
++async fn persist_provider_account_selection(
++    config: &Config,
++    provider_id: &str,
++    account: &ModelProviderAccount,
++) {
++    let mut edits = Vec::new();
++    if let Some(base_url) = &account.base_url {
++        edits.push(ConfigEdit::SetPath {
++            segments: vec![
++                "model_providers".to_string(),
++                provider_id.to_string(),
++                "base_url".to_string(),
++            ],
++            value: value(base_url.to_string()),
++        });
++    }
++    if let Some(env_key) = &account.env_key {
++        edits.push(ConfigEdit::SetPath {
++            segments: vec![
++                "model_providers".to_string(),
++                provider_id.to_string(),
++                "env_key".to_string(),
++            ],
++            value: value(env_key.to_string()),
++        });
++    }
++
++    if edits.is_empty() {
++        return;
++    }
++
++    if let Err(err) = ConfigEditsBuilder::new(&config.codex_home)
++        .with_edits(edits)
++        .apply()
++        .await
++    {
++        warn!("failed to persist account switch for provider {provider_id}: {err}");
++    }
++}
++
++async fn maybe_switch_provider_account(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++    attempted_accounts: &mut HashSet<ModelProviderAccount>,
++    err: &CodexErr,
++    retries: u64,
++    max_retries: u64,
++) -> Option<Arc<TurnContext>> {
++    if !should_switch_provider_account(err, retries, max_retries) {
++        return None;
++    }
++
++    let (provider_id, provider) = {
++        let state = sess.state.lock().await;
++        (
++            state.session_configuration.provider_id.clone(),
++            state.session_configuration.provider.clone(),
++        )
++    };
++    let next_account = next_account_from_pool(provider_id.as_str(), &provider, attempted_accounts)?;
++    let next_provider = provider.with_account(&next_account);
++
++    if let Err(err) = sess
++        .update_settings(SessionSettingsUpdate {
++            model_provider_id: Some(provider_id.clone()),
++            model_provider: Some(next_provider),
++            ..Default::default()
++        })
++        .await
++    {
++        warn!("failed to switch provider account for {provider_id}: {err}");
++        return None;
++    }
++
++    let session_configuration = {
++        let state = sess.state.lock().await;
++        state.session_configuration.clone()
++    };
++    let updated_context = sess
++        .new_turn_from_configuration(
++            turn_context.sub_id.clone(),
++            session_configuration,
++            Some(turn_context.final_output_json_schema.clone()),
++            false,
++        )
++        .await;
++
++    let config = turn_context.client.config();
++    persist_provider_account_selection(config.as_ref(), provider_id.as_str(), &next_account).await;
++    let account_base_url = next_account
++        .base_url
++        .clone()
++        .unwrap_or_else(|| "<default>".to_string());
++    sess.notify_background_event(
++        updated_context.as_ref(),
++        format!("Switched provider account for {provider_id} to {account_base_url} after {err}"),
++    )
++    .await;
++
++    Some(updated_context)
++}
++
+ #[instrument(level = "trace",
+     skip_all,
+     fields(
+@@ -2457,11 +2680,11 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>)
+ )]
+ async fn run_turn(
+     sess: Arc<Session>,
+-    turn_context: Arc<TurnContext>,
++    mut turn_context: Arc<TurnContext>,
+     turn_diff_tracker: SharedTurnDiffTracker,
+     input: Vec<ResponseItem>,
+     cancellation_token: CancellationToken,
+-) -> CodexResult<TurnRunResult> {
++) -> CodexResult<TurnRunOutcome> {
+     let mcp_tools = sess
+         .services
+         .mcp_connection_manager
+@@ -2494,6 +2717,14 @@ async fn run_turn(
+     };
+ 
+     let mut retries = 0;
++    let mut attempted_accounts = {
++        let mut attempted = HashSet::new();
++        let state = sess.state.lock().await;
++        if let Some(account) = state.session_configuration.provider.current_account() {
++            attempted.insert(account);
++        }
++        attempted
++    };
+     loop {
+         let err = match try_run_turn(
+             Arc::clone(&router),
+@@ -2505,7 +2736,12 @@ async fn run_turn(
+         )
+         .await
+         {
+-            Ok(output) => return Ok(output),
++            Ok(output) => {
++                return Ok(TurnRunOutcome {
++                    turn_context,
++                    result: output,
++                });
++            }
+             Err(CodexErr::ContextWindowExceeded) => {
+                 sess.set_total_tokens_full(&turn_context).await;
+                 return Err(CodexErr::ContextWindowExceeded);
+@@ -2520,12 +2756,27 @@ async fn run_turn(
+             Err(err) => err,
+         };
+ 
++        // Use the configured provider-specific stream retry budget.
++        let max_retries = turn_context.client.get_provider().stream_max_retries();
++        if let Some(updated_context) = maybe_switch_provider_account(
++            &sess,
++            &turn_context,
++            &mut attempted_accounts,
++            &err,
++            retries,
++            max_retries,
++        )
++        .await
++        {
++            turn_context = updated_context;
++            retries = 0;
++            continue;
++        }
++
+         if !err.is_retryable() {
+             return Err(err);
+         }
+ 
+-        // Use the configured provider-specific stream retry budget.
+-        let max_retries = turn_context.client.get_provider().stream_max_retries();
+         if retries < max_retries {
+             retries += 1;
+             let delay = match &err {
+@@ -2553,6 +2804,12 @@ async fn run_turn(
+     }
+ }
+ 
++#[derive(Debug)]
++struct TurnRunOutcome {
++    turn_context: Arc<TurnContext>,
++    result: TurnRunResult,
++}
++
+ #[derive(Debug)]
+ struct TurnRunResult {
+     needs_follow_up: bool,
+@@ -3133,6 +3390,7 @@ mod tests {
+         let config = Arc::new(config);
+         let model = ModelsManager::get_model_offline(config.model.as_deref());
+         let session_configuration = SessionConfiguration {
++            provider_id: config.model_provider_id.clone(),
+             provider: config.model_provider.clone(),
+             model,
+             model_reasoning_effort: config.model_reasoning_effort,
+@@ -3199,6 +3457,7 @@ mod tests {
+         let config = Arc::new(config);
+         let model = ModelsManager::get_model_offline(config.model.as_deref());
+         let session_configuration = SessionConfiguration {
++            provider_id: config.model_provider_id.clone(),
+             provider: config.model_provider.clone(),
+             model,
+             model_reasoning_effort: config.model_reasoning_effort,
+@@ -3449,6 +3708,7 @@ mod tests {
+         let agent_status = Arc::new(RwLock::new(AgentStatus::PendingInit));
+         let model = ModelsManager::get_model_offline(config.model.as_deref());
+         let session_configuration = SessionConfiguration {
++            provider_id: config.model_provider_id.clone(),
+             provider: config.model_provider.clone(),
+             model,
+             model_reasoning_effort: config.model_reasoning_effort,
+@@ -3543,6 +3803,7 @@ mod tests {
+         let agent_status = Arc::new(RwLock::new(AgentStatus::PendingInit));
+         let model = ModelsManager::get_model_offline(config.model.as_deref());
+         let session_configuration = SessionConfiguration {
++            provider_id: config.model_provider_id.clone(),
+             provider: config.model_provider.clone(),
+             model,
+             model_reasoning_effort: config.model_reasoning_effort,
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 6099e1c29..27ef37749 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -3118,6 +3118,7 @@ model_verbosity = "high"
+             stream_max_retries: Some(10),
+             stream_idle_timeout_ms: Some(300_000),
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         };
+         let model_provider_map = {
+             let mut model_provider_map = built_in_model_providers();
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 370c1ecb9..05a3474d1 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -55,6 +55,7 @@ pub use model_provider_info::CHAT_WIRE_API_DEPRECATION_SUMMARY;
+ pub use model_provider_info::DEFAULT_LMSTUDIO_PORT;
+ pub use model_provider_info::DEFAULT_OLLAMA_PORT;
+ pub use model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
++pub use model_provider_info::ModelProviderAccount;
+ pub use model_provider_info::ModelProviderInfo;
+ pub use model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+ pub use model_provider_info::WireApi;
+diff --git a/codex-rs/core/src/model_provider_info.rs b/codex-rs/core/src/model_provider_info.rs
+index 961739223..73f1e0b07 100644
+--- a/codex-rs/core/src/model_provider_info.rs
++++ b/codex-rs/core/src/model_provider_info.rs
+@@ -47,6 +47,15 @@ pub enum WireApi {
+     Chat,
+ }
+ 
++/// Serializable representation of an account entry within a provider.
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
++pub struct ModelProviderAccount {
++    /// Base URL for this account's OpenAI-compatible API endpoint.
++    pub base_url: Option<String>,
++    /// Environment variable that stores the API key for this account.
++    pub env_key: Option<String>,
++}
++
+ /// Serializable representation of a provider definition.
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+ pub struct ModelProviderInfo {
+@@ -99,6 +108,10 @@ pub struct ModelProviderInfo {
+     /// and API key (if needed) comes from the "env_key" environment variable.
+     #[serde(default)]
+     pub requires_openai_auth: bool,
++
++    /// Optional pool of accounts for this provider. Each entry is a (base_url, env_key) pair.
++    #[serde(default)]
++    pub account_pool: Vec<ModelProviderAccount>,
+ }
+ 
+ impl ModelProviderInfo {
+@@ -190,6 +203,33 @@ impl ModelProviderInfo {
+         }
+     }
+ 
++    pub fn current_account(&self) -> Option<ModelProviderAccount> {
++        let base_url = self
++            .base_url
++            .as_deref()
++            .map(str::trim)
++            .filter(|value| !value.is_empty());
++        let env_key = self
++            .env_key
++            .as_deref()
++            .map(str::trim)
++            .filter(|value| !value.is_empty());
++        match (base_url, env_key) {
++            (Some(base_url), Some(env_key)) => Some(ModelProviderAccount {
++                base_url: Some(base_url.to_string()),
++                env_key: Some(env_key.to_string()),
++            }),
++            _ => None,
++        }
++    }
++
++    pub fn with_account(&self, account: &ModelProviderAccount) -> Self {
++        let mut provider = self.clone();
++        provider.base_url = account.base_url.clone();
++        provider.env_key = account.env_key.clone();
++        provider
++    }
++
+     /// Effective maximum number of request retries for this provider.
+     pub fn request_max_retries(&self) -> u64 {
+         self.request_max_retries
+@@ -247,6 +287,7 @@ impl ModelProviderInfo {
+             stream_max_retries: None,
+             stream_idle_timeout_ms: None,
+             requires_openai_auth: true,
++            account_pool: Vec::new(),
+         }
+     }
+ 
+@@ -320,6 +361,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
+         stream_max_retries: None,
+         stream_idle_timeout_ms: None,
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     }
+ }
+ 
+@@ -348,6 +390,7 @@ base_url = "http://localhost:11434/v1"
+             stream_max_retries: None,
+             stream_idle_timeout_ms: None,
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         };
+ 
+         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
+@@ -378,6 +421,7 @@ query_params = { api-version = "2025-04-01-preview" }
+             stream_max_retries: None,
+             stream_idle_timeout_ms: None,
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         };
+ 
+         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
+@@ -411,6 +455,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+             stream_max_retries: None,
+             stream_idle_timeout_ms: None,
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         };
+ 
+         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
+@@ -442,6 +487,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+                 stream_max_retries: None,
+                 stream_idle_timeout_ms: None,
+                 requires_openai_auth: false,
++                account_pool: Vec::new(),
+             };
+             let api = provider.to_api_provider(None).expect("api provider");
+             assert!(
+@@ -464,6 +510,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+             stream_max_retries: None,
+             stream_idle_timeout_ms: None,
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         };
+         let named_api = named_provider.to_api_provider(None).expect("api provider");
+         assert!(named_api.is_azure_responses_endpoint());
+@@ -488,6 +535,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
+                 stream_max_retries: None,
+                 stream_idle_timeout_ms: None,
+                 requires_openai_auth: false,
++                account_pool: Vec::new(),
+             };
+             let api = provider.to_api_provider(None).expect("api provider");
+             assert!(
+diff --git a/codex-rs/core/src/models_manager/manager.rs b/codex-rs/core/src/models_manager/manager.rs
+index 87ff1b76d..fd493727a 100644
+--- a/codex-rs/core/src/models_manager/manager.rs
++++ b/codex-rs/core/src/models_manager/manager.rs
+@@ -396,6 +396,7 @@ mod tests {
+             stream_max_retries: Some(0),
+             stream_idle_timeout_ms: Some(5_000),
+             requires_openai_auth: false,
++            account_pool: Vec::new(),
+         }
+     }
+ 
+diff --git a/codex-rs/core/tests/chat_completions_payload.rs b/codex-rs/core/tests/chat_completions_payload.rs
+index b449f200d..ba039b57b 100644
+--- a/codex-rs/core/tests/chat_completions_payload.rs
++++ b/codex-rs/core/tests/chat_completions_payload.rs
+@@ -59,6 +59,7 @@ async fn run_request(input: Vec<ResponseItem>) -> Value {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = match TempDir::new() {
+diff --git a/codex-rs/core/tests/chat_completions_sse.rs b/codex-rs/core/tests/chat_completions_sse.rs
+index 6c0e668e7..9b1bd535d 100644
+--- a/codex-rs/core/tests/chat_completions_sse.rs
++++ b/codex-rs/core/tests/chat_completions_sse.rs
+@@ -58,6 +58,7 @@ async fn run_stream_with_bytes(sse_body: &[u8]) -> Vec<ResponseEvent> {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = match TempDir::new() {
+diff --git a/codex-rs/core/tests/responses_headers.rs b/codex-rs/core/tests/responses_headers.rs
+index e1a2df121..4a66da704 100644
+--- a/codex-rs/core/tests/responses_headers.rs
++++ b/codex-rs/core/tests/responses_headers.rs
+@@ -53,6 +53,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = TempDir::new().expect("failed to create TempDir");
+@@ -147,6 +148,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = TempDir::new().expect("failed to create TempDir");
+@@ -237,6 +239,7 @@ async fn responses_respects_model_info_overrides_from_config() {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = TempDir::new().expect("failed to create TempDir");
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 2c08083ba..fb4928586 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -1133,6 +1133,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
+         stream_max_retries: Some(0),
+         stream_idle_timeout_ms: Some(5_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let codex_home = TempDir::new().unwrap();
+@@ -1633,6 +1634,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
+         stream_max_retries: None,
+         stream_idle_timeout_ms: None,
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     // Init session
+@@ -1716,6 +1718,7 @@ async fn env_var_overrides_loaded_auth() {
+         stream_max_retries: None,
+         stream_idle_timeout_ms: None,
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     // Init session
+diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+index e7a609126..606e254c0 100644
+--- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
++++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+@@ -73,6 +73,7 @@ async fn continue_after_stream_error() {
+         stream_max_retries: Some(1),
+         stream_idle_timeout_ms: Some(2_000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let TestCodex { codex, .. } = test_codex()
+diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
+index a203658c2..b16f31fb4 100644
+--- a/codex-rs/core/tests/suite/stream_no_completed.rs
++++ b/codex-rs/core/tests/suite/stream_no_completed.rs
+@@ -81,6 +81,7 @@ async fn retries_on_early_close() {
+         stream_max_retries: Some(1),
+         stream_idle_timeout_ms: Some(2000),
+         requires_openai_auth: false,
++        account_pool: Vec::new(),
+     };
+ 
+     let TestCodex { codex, .. } = test_codex()
+diff --git a/docs/config.md b/docs/config.md
+index 2b64253d3..c18594523 100644
+--- a/docs/config.md
++++ b/docs/config.md
+@@ -6,6 +6,43 @@ For advanced configuration instructions, see [this documentation](https://develo
+ 
+ For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
+ 
++## Provider account pool
++
++Codex can automatically fail over to another account within the *same* provider
++when the current account fails. The provider is still chosen by
++`model_provider` (or a profile), and only the accounts in that provider's
++`account_pool` are rotated.
++
++Each account entry is a `(base_url, env_key)` pair:
++
++```toml
++model_provider = "openai-proxy"
++
++[model_providers.openai-proxy]
++name = "OpenAI Proxy"
++wire_api = "responses"
++account_pool = [
++  { base_url = "https://api.vectorengine.ai/v1", env_key = "OPENAI_API_KEY_01" },
++  { base_url = "https://api.vectorengine.ai/v1", env_key = "OPENAI_API_KEY_02" }
++]
++
++[profiles.gemini]
++model_provider = "gemini-proxy"
++
++[model_providers.gemini-proxy]
++name = "Gemini Proxy"
++wire_api = "chat"
++account_pool = [
++  { base_url = "https://generativelanguage.googleapis.com/v1beta", env_key = "GEMINI_API_KEY_01" }
++]
++```
++
++When a switch happens, Codex updates
++`model_providers.<provider_id>.base_url` and `.env_key` in `config.toml` and
++keeps the selected provider unchanged. The pool is tried in order, starting
++after the current account and wrapping around until each account has been
++attempted once per turn.
++
+ ## Connecting to MCP servers
+ 
+ Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:
